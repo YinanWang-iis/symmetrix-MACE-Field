@@ -1,3 +1,31 @@
+# Symmetrix with MACE-Field support
+
+This repository is a fork of [symmetrix](https://github.com/wcwitt/symmetrix) 0.3.1 that adds
+[MACE-Field](https://github.com/mdi-group/mace-field) (electric-field-aware MACE) models to the GPU foundation
+evaluator: the Python `MACEFoundation` calculator and the LAMMPS `pair_style symmetrix/mace/foundation/kk`
+(`efield` keyword, polarization via `compute pair`). See the
+[pair_symmetrix README](pair_symmetrix/README.md#mace-field-models-experimental-prototype-kokkos-gpu-only) for usage.
+
+### Speed-up
+
+LAMMPS NVE MD of BaTiO<sub>3</sub> with a MACE-Field model fine-tuned from MACE-MP-0 medium, field
+&epsilon;<sub>z</sub> = 0.03 V/&Aring;, 1 fs time step, one RTX 5090. Reference: the same model in LAMMPS through
+ML-IAP (`pair_style mliap unified`, fp32, cuEquivariance).
+
+| Atoms | mliap fp32 | symmetrix fp64 | symmetrix fp32 | symmetrix fp32-mixed |
+|---:|---:|---:|---:|---:|
+| 2,560 | 1.46 ns/day | 2.20 ns/day (1.5&times;) | 21.4 ns/day (**14.6&times;**) | 25.7 ns/day (**17.5&times;**) |
+| 20,480 | out of memory | 0.30 ns/day | 3.71 ns/day | 4.60 ns/day |
+
+<p>
+<img src="docs/macefield/speed_2560.png" width="45%">
+<img src="docs/macefield/speed_20480.png" width="45%">
+</p>
+
+The GPU was shared with another job during the benchmark, so absolute numbers are indicative.
+
+---
+
 # Symmetrix
 
 [![CI](https://github.com/wcwitt/symmetrix/actions/workflows/ci.yaml/badge.svg)](https://github.com/wcwitt/symmetrix/actions/workflows/ci.yaml?branch=main)
