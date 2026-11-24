@@ -1222,6 +1222,8 @@ void MACEFoundation<Precision>::load(const std::string& filename, const std::str
         throw std::runtime_error(prefix + filename + " was extracted by an incompatible symmetrix version; "
                                                      "extract it again");
     if (js.contains("model_type")) throw std::runtime_error(prefix + filename + " is not a MACE model");
+    if (js.contains("field_coupling"))
+        throw std::runtime_error(prefix + "MACE-Field models are supported only by the CUDA evaluator");
     if (not js.contains("first_layer_weights"))
         throw std::runtime_error(prefix + "the model file has no first-layer basis; "
                                           "extract it again with this Symmetrix");

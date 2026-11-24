@@ -175,8 +175,8 @@ template <class T> using Array = py::array_t<T, py::array::c_style | py::array::
 
 PYBIND11_MODULE(_mace_foundation, m)
 {
-    py::class_<Evaluator>(m, "MACEFoundation")
-        .def(py::init([](const std::string& file, const std::string& device, const std::string& dtype,
+    py::class_<Evaluator> cls(m, "MACEFoundation");
+    cls.def(py::init([](const std::string& file, const std::string& device, const std::string& dtype,
                          double skin) -> std::unique_ptr<Evaluator> {
                  if (dtype != "float64" and dtype != "float32" and dtype != "float32-mixed")
                      throw std::invalid_argument("dtype must be 'float64', 'float32' or 'float32-mixed', "
@@ -213,6 +213,17 @@ PYBIND11_MODULE(_mace_foundation, m)
             }
             return py::make_tuple(energy, forces, virial, energies ? py::object(e) : py::none());
         }, py::arg("x"), py::arg("numbers"), py::arg("cell"), py::arg("pbc"), py::arg("energies") = false);
+    // MACE-Field
+    cls.def_property_readonly("has_field_coupling", &Evaluator::has_field_coupling)
+       .def("set_electric_field", [](Evaluator& self, Array<double> e) {
+            if (e.size() != 3) throw std::invalid_argument("expected electric_field[3]");
+            self.set_electric_field(e.data());
+        }, py::arg("electric_field"))
+       .def("polarization", [](const Evaluator& self) {
+            Array<double> p(3);
+            self.polarization(p.mutable_data());
+            return p;
+        });
 
     m.def("neighbor_list", [](Array<double> x, Array<double> cell, Array<bool> pbc, double cutoff) {
         const int n = int(x.size()/3);

@@ -5,9 +5,17 @@ from ase.calculators.calculator import BaseCalculator, all_changes
 
 
 class MACEFoundation(BaseCalculator):
-    implemented_properties = ["energy", "free_energy", "energies", "forces", "stress"]
+    """MACE foundation-model evaluator.
 
-    def __init__(self, model_file, device="cuda", dtype="float64", skin=1.0):
+    MACE-Field models (extracted with ``symmetrix.extract_mace_field``, CUDA only): the uniform field is
+    ``electric_field`` (V/A, the model's ``electric_field`` input, Cartesian), or ``atoms.info["electric_field"]``
+    when ``electric_field`` is None.  ``results["polarization"]`` is P = -dE/d(field) in e*A for the whole cell
+    (mace-field reports this divided by the cell volume).
+    """
+
+    implemented_properties = ["energy", "free_energy", "energies", "forces", "stress", "polarization"]
+
+    def __init__(self, model_file, device="cuda", dtype="float64", skin=1.0, electric_field=None):
         from ._mace_foundation import MACEFoundation as Evaluator
 
         warnings.warn(
@@ -17,6 +25,7 @@ class MACEFoundation(BaseCalculator):
         )
         BaseCalculator.__init__(self)
         self.evaluator = Evaluator(str(model_file), device, dtype, skin)
+        self.electric_field = electric_field
 
     def get_spin_polarized(self):
         return False
@@ -25,10 +34,17 @@ class MACEFoundation(BaseCalculator):
         if atoms is not None:
             self.atoms = atoms.copy()
         a = self.atoms
+        field = self.electric_field
+        if field is None:
+            field = a.info.get("electric_field")
+        field = np.zeros(3) if field is None else np.asarray(field, dtype=float).reshape(3)
+        self.evaluator.set_electric_field(field)
         energy, forces, virial, energies = self.evaluator.compute(
             a.positions, a.numbers, a.cell.array, a.pbc, "energies" in properties
         )
         self.results = {"energy": energy, "free_energy": energy, "forces": forces}
+        if self.evaluator.has_field_coupling:
+            self.results["polarization"] = np.asarray(self.evaluator.polarization())
         if energies is not None:
             self.results["energies"] = energies
         if a.pbc.all():

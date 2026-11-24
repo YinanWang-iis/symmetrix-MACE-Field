@@ -40,6 +40,10 @@ template <class real> struct Model {
     int zbl_p;
     bool ordered;
     const real *residual_0, *H1_bias, *z_bias;
+    // MACE-Field coupling (field mode): h' = h - sum_t W_t cg_t h eps
+    const real *field_E, *field_C, *field_b;
+    int field_nt;
+    int field_li[8], field_lo[8], field_tl[8], field_ntl[4];
 };
 
 template <class real> struct Graph {
@@ -55,6 +59,8 @@ template <class real> struct Graph {
     double* node_energies;
     unsigned* err;
     real *X0, *X1, *Tg, *T_adj, *X_adj, *B1, *B1_adj, *M0s_adj, *M1, *M1_adj;
+    real *Hh, *Vf, *Df;
+    double* P;
 };
 
 }  // namespace mace_foundation
@@ -193,6 +199,20 @@ Buffer<Precision> M1_weights, M1, M1_adj;
 // Gates
 Weight linear_2_0, linear_2_1, residual_1_weights;
 Buffer<Precision> residual_0, Tg, T_adj, X0, X1, X_adj, B1, B1_adj;
+
+// MACE-Field coupling
+bool field_mode = false;
+Weight W0_weights, field_Wl[4];
+Buffer<Precision> field_C, field_b, field_E, Hh, Vf, Df;
+Buffer<double> field_P;
+int field_nt = 0;
+int field_li[8] = {}, field_lo[8] = {}, field_tl[8] = {}, field_ntl[4] = {};
+long field_voff(int lo) const {
+    long o = 0;
+    for (int l = 0; l < lo; ++l) o += (long)N*(2*l+1)*field_ntl[l]*num_channels;
+    return o;
+}
+void set_electric_field(const double* e);
 
 // Readouts
 Buffer<Precision> z_weights_for_M0, z_weights_for_M1, z_bias;
@@ -920,6 +940,121 @@ template <class Sh, class real> __global__ void k_h1_bias(Model<real> M, Graph<r
     if (i < (long)G.N*Sh::C) G.H1[i] += M.H1_bias[(long)G.elem[i/Sh::C]*Sh::C + i%Sh::C];
 }
 
+// MACE-Field (field mode).  h = M0 W0 + b (Hh),  V_t[n,mo,k'] = \sum_{mi,mf} cg_t[mo,mi,mf] h_{l_in}[n,k',mi] eps_mf,
+// D_{l_out} = \sum_t V_t W_t^T (GEMM),  h' = h - D (written to M0).
+template <class Sh, class real> __device__ __forceinline__ long field_v(const Model<real>& M, int N, int t, int n, int mo,
+                                                                        int k) {
+    constexpr int C = Sh::C;
+    const int lo = M.field_lo[t];
+    long o = 0;
+    for (int l = 0; l < lo; ++l) o += (long)N*(2*l+1)*M.field_ntl[l]*C;
+    const int K = M.field_ntl[lo]*C;
+    return o + ((long)n*(2*lo+1) + mo)*K + M.field_tl[t]*C + k;
+}
+template <class Sh, class real> __global__ void __launch_bounds__(Sh::C) k_field_prep(Model<real> M, Graph<real> G) {
+    constexpr int C = Sh::C;
+    constexpr int NL = Sh::num_LM;
+    const int n = blockIdx.x;
+    const int k = threadIdx.x;
+    const real e[3] = {M.field_E[0], M.field_E[1], M.field_E[2]};
+    real h[NL];
+    for (int LM = 0; LM < NL; ++LM) {
+        const long i = row(LM, n, G.N)*C + k;
+        h[LM] = G.Hh[i] + (LM == 0 and M.field_b ? M.field_b[(long)G.elem[n]*C + k] : real(0));
+        G.Hh[i] = h[LM];
+    }
+    float m = 0;
+    for (int t = 0; t < M.field_nt; ++t) {
+        const int li = M.field_li[t];
+        const int ni = 2*li + 1;
+        const int no = 2*M.field_lo[t] + 1;
+        const real* cg = M.field_C + 75*t;
+        for (int mo = 0; mo < no; ++mo) {
+            real v = 0;
+            for (int mi = 0; mi < ni; ++mi)
+                for (int mf = 0; mf < 3; ++mf) v += cg[(mo*ni + mi)*3 + mf]*h[li*li + mi]*e[mf];
+            G.Vf[field_v<Sh>(M, G.N, t, n, mo, k)] = v;
+            m = fmaxf(m, fabsf(float(v)));
+        }
+    }
+    amax(M, 14, m);
+}
+template <class Sh, class real> __global__ void __launch_bounds__(Sh::C) k_field_apply(Model<real> M, Graph<real> G) {
+    constexpr int C = Sh::C;
+    constexpr int NL = Sh::num_LM;
+    const int n = blockIdx.x;
+    const int k = threadIdx.x;
+    float m = 0;
+    for (int LM = 0; LM < NL; ++LM) {
+        const long i = row(LM, n, G.N)*C + k;
+        const real v = G.Hh[i] - (M.field_ntl[lm_l(LM)] ? G.Df[i] : real(0));
+        G.M0[i] = v;
+        m = fmaxf(m, fabsf(float(v)));
+    }
+    amax(M, 12, m);
+}
+// reverse: \bar{h}' = \bar{M}^{(0)} (+ scalar readout adjoint),  U_t = \bar{h}'_{l_out} W_t (GEMM, into Vf),
+// \bar{h}_{l_in}[k',mi] = \bar{h}'_{l_in}[k',mi] - \sum_{t,mo,mf} cg_t[mo,mi,mf] eps_mf U_t[k',mo],
+// P_mf = -\partial E/\partial eps_mf = \sum_{t,k',mo,mi} cg_t[mo,mi,mf] U_t[k',mo] h_{l_in}[k',mi]
+template <class Sh, class real> __global__ void __launch_bounds__(Sh::C) k_field_grad(Model<real> M, Graph<real> G) {
+    constexpr int C = Sh::C;
+    constexpr int NL = Sh::num_LM;
+    const int n = blockIdx.x;
+    const int k = threadIdx.x;
+    const long s = (long)n*C + k;
+    G.M0_adj[s] += G.M0s_adj[s];
+    G.M0s_adj[s] = 0;
+    float m = 0;
+    for (int LM = 0; LM < NL; ++LM) m = fmaxf(m, fabsf(float(G.M0_adj[row(LM, n, G.N)*C + k])));
+    amax(M, 15, m);
+}
+template <class Sh, class real> __global__ void __launch_bounds__(Sh::C) k_field_reverse(Model<real> M, Graph<real> G) {
+    constexpr int C = Sh::C;
+    constexpr int NL = Sh::num_LM;
+    __shared__ double part[3][C/32];
+    const int n = blockIdx.x;
+    const int k = threadIdx.x;
+    const real e[3] = {M.field_E[0], M.field_E[1], M.field_E[2]};
+    real h[NL], g[NL];
+    for (int LM = 0; LM < NL; ++LM) {
+        const long i = row(LM, n, G.N)*C + k;
+        g[LM] = G.M0_adj[i];
+        h[LM] = G.Hh[i];
+    }
+    double p[3] = {0, 0, 0};
+    for (int t = 0; t < M.field_nt; ++t) {
+        const int li = M.field_li[t];
+        const int ni = 2*li + 1;
+        const int no = 2*M.field_lo[t] + 1;
+        const real* cg = M.field_C + 75*t;
+        real u[5];
+        for (int mo = 0; mo < no; ++mo) u[mo] = G.Vf[field_v<Sh>(M, G.N, t, n, mo, k)];
+        for (int mi = 0; mi < ni; ++mi)
+            for (int mf = 0; mf < 3; ++mf) {
+                real c = 0;
+                for (int mo = 0; mo < no; ++mo) c += cg[(mo*ni + mi)*3 + mf]*u[mo];
+                g[li*li + mi] -= c*e[mf];
+                p[mf] += double(c)*double(h[li*li + mi]);
+            }
+    }
+    float m = 0;
+    for (int LM = 0; LM < NL; ++LM) {
+        G.Hh[row(LM, n, G.N)*C + k] = g[LM];
+        m = fmaxf(m, fabsf(float(g[LM])));
+    }
+    amax(M, 13, m);
+    for (int f = 0; f < 3; ++f) {
+        const double v = warp_sum(p[f]);
+        if ((k & 31) == 0) part[f][k >> 5] = v;
+    }
+    __syncthreads();
+    if (k < 3) {
+        double q = 0;
+        for (int r = 0; r < C/32; ++r) q += part[k][r];
+        atomicAdd(G.P + k, q);
+    }
+}
+
 template <class real> __global__ void k_outputs(Graph<real> G, double* eatom, double* out) {
     __shared__ double part[7][WARPS];
     const int n = (blockIdx.x*blockDim.x + threadIdx.x) >> 5;
@@ -1253,6 +1388,16 @@ Model<Precision> MACEFoundationCuda<Precision, mixed>::model() const
     M.residual_0 = residual_0;
     M.H1_bias = H1_bias;
     M.z_bias = z_bias;
+    if (field_mode) {
+        M.field_E = field_E;
+        M.field_C = field_C;
+        M.field_b = field_b;
+        M.field_nt = field_nt;
+        std::copy(field_li, field_li + 8, M.field_li);
+        std::copy(field_lo, field_lo + 8, M.field_lo);
+        std::copy(field_tl, field_tl + 8, M.field_tl);
+        std::copy(field_ntl, field_ntl + 4, M.field_ntl);
+    }
     return M;
 }
 
@@ -1262,7 +1407,8 @@ Graph<Precision> MACEFoundationCuda<Precision, mixed>::graph() const
     return {N, NR, atom_of_node, elem, row_of_atom, elem_all, count, start, seg, geometry, neigh_indices,
             row_pair, edge_forces,
             Phi0, A0, M0, H1, Phi1, A1, H1_adj, A1_adj, dPhi1, M0_adj, A0_adj, Phi0_adj,
-            s0, s1, dot0, dot1, node_energies, err, X0, X1, Tg, T_adj, X_adj, B1, B1_adj, M0s_adj, M1, M1_adj};
+            s0, s1, dot0, dot1, node_energies, err, X0, X1, Tg, T_adj, X_adj, B1, B1_adj, M0s_adj, M1, M1_adj,
+            Hh, Vf, Df, field_P};
 }
 
 template <class Precision, bool mixed>
@@ -1304,6 +1450,13 @@ void MACEFoundationCuda<Precision, mixed>::reserve(long E)
         B1_adj.reserve(nn*(4 + num_LM - 1)*CN);
     }
     M0s_adj.reserve(nn*CN);
+    if (field_mode) {
+        Hh.reserve(nn*num_LM*C);
+        Df.reserve(nn*num_LM*C);
+        long v = 0;
+        for (int l = 0; l <= L_max; ++l) v += nn*(2*l+1)*field_ntl[l]*C;
+        Vf.reserve(std::max(v, 1L));
+    }
     M1.reserve(nn*CN);
     M1_adj.reserve(nn*CN);
     s0.reserve(nn);
@@ -1325,7 +1478,7 @@ void MACEFoundationCuda<Precision, mixed>::compute_first_layer(
     constexpr int C = Sh::C;
     constexpr int CN = Sh::CN;
     const int T = num_elements;
-    if (M.amax) CHECK(cudaMemsetAsync(amax, 0, 12*sizeof(unsigned), stream));
+    if (M.amax) CHECK(cudaMemsetAsync(amax, 0, 16*sizeof(unsigned), stream));
 
     // A0
     // \Phi^{(0)}_{i,lm,bn} = \sum_{j:a_j=b} \beta_{a_ib,n}(r_{ij}) Y_{lm}(\hat{\mathbf{r}}_{ij})
@@ -1356,10 +1509,26 @@ void MACEFoundationCuda<Precision, mixed>::compute_first_layer(
     // M^{(0)}_{i,klm} = \sum_{\nu\mathbf{l}'\mathbf{m}'} w_{a_iklm,\nu\mathbf{l}'\mathbf{m}'} \prod_{\xi=1}^{\nu} \tilde{A}^{(0)}_{i,kl'_\xi m'_\xi},  X^{(0)} for \tilde{A}^{(0)} if gated
     k_M<Sh, 0><<<N, CN, 0, stream>>>(M, G);
 
+    // MACE-Field: h = M0 W0 + b,  h' = h - \sum_t W_t cg_t h eps (written over M0; h kept in Hh)
+    if (field_mode) {
+        for (int L = 0; L <= Sh::L_max; ++L)
+            gemm(false, N*(2*L+1), C, CN, G.M0 + (long)N*L*L*CN, CN, W0_weights, (long)L*CN*C,
+                 G.Hh + (long)N*L*L*C, C, 1);
+        products();
+        k_field_prep<Sh><<<N, C, 0, stream>>>(M, G);
+        for (int lo = 0; lo <= Sh::L_max; ++lo)
+            if (field_ntl[lo])
+                gemm(false, N*(2*lo+1), C, field_ntl[lo]*C, G.Vf + field_voff(lo), field_ntl[lo]*C, field_Wl[lo], 0,
+                     G.Df + (long)N*lo*lo*C, C, 14);
+        products();
+        k_field_apply<Sh><<<N, C, 0, stream>>>(M, G);
+    }
+
     // H1
     // H^{(1)}_{i,klm} = \sum_{k'} w_{kl,k'} M^{(0)}_{i,k'lm} + \delta_{l0} b^{(1)}_{a_i,k}
     for (int L = 0; L <= Sh::L_max; ++L)
-        gemm(false, N*(2*L+1), C, CN, G.M0 + (long)N*L*L*CN, CN, H1_weights, (long)L*CN*C, G.H1 + (long)NR*L*L*C, C, 1);
+        gemm(false, N*(2*L+1), C, CN, G.M0 + (long)N*L*L*CN, CN, H1_weights, (long)L*CN*C, G.H1 + (long)NR*L*L*C, C,
+             field_mode ? 12 : 1);
     products();
     if (M.H1_bias) k_h1_bias<Sh><<<blocks((long)N*C, 256), 256, 0, stream>>>(M, G);
 }
@@ -1498,6 +1667,22 @@ void MACEFoundationCuda<Precision, mixed>::reverse_first_layer(
         gemm(true, N*(2*L+1), CN, C, G.H1_adj + (long)NR*L*L*C, C, H1_weights, (long)L*CN*C,
              G.M0_adj + (long)N*L*L*CN, CN, 4);
     products();
+
+    // MACE-Field: adjoint of h' = h - Delta(h, eps), P = -dE/deps, then \bar{M}^{(0)} = \bar{h} W0^T
+    if (field_mode) {
+        CHECK(cudaMemsetAsync(G.P, 0, 3*sizeof(double), stream));
+        k_field_grad<Sh><<<N, C, 0, stream>>>(M, G);
+        for (int lo = 0; lo <= Sh::L_max; ++lo)
+            if (field_ntl[lo])
+                gemm(true, N*(2*lo+1), field_ntl[lo]*C, C, G.M0_adj + (long)N*lo*lo*C, C, field_Wl[lo], 0,
+                     G.Vf + field_voff(lo), field_ntl[lo]*C, 15);
+        products();
+        k_field_reverse<Sh><<<N, C, 0, stream>>>(M, G);
+        for (int L = 0; L <= Sh::L_max; ++L)
+            gemm(true, N*(2*L+1), CN, C, G.Hh + (long)N*L*L*C, C, W0_weights, (long)L*CN*C,
+                 G.M0_adj + (long)N*L*L*CN, CN, 13);
+        products();
+    }
 
     // M0
     // \bar{\tilde{A}}^{(0)}_{i,klm} = \sum_{l'm'} \bar{M}^{(0)}_{i,kl'm'} \partial M^{(0)}_{i,kl'm'} / \partial \tilde{A}^{(0)}_{i,klm},  \bar{X}^{(0)} for \bar{\tilde{A}}^{(0)} if gated
@@ -1875,6 +2060,50 @@ void MACEFoundationCuda<Precision, mixed>::load(const std::string& filename, con
         set_weight(residual_1_weights, js.at("residual_1_weights").get<std::vector<Precision>>(), blocks);
     }
 
+    field_mode = js.contains("field_coupling");
+    if (field_mode) {
+        if (gated or C != CN) throw std::runtime_error(prefix + "the field coupling needs an ungated model with "
+                                                                "num_channels_node == num_channels");
+        const json& fc = js.at("field_coupling");
+        std::vector<Precision> w0;
+        for (double v : fc.at("W0").get<std::vector<double>>()) w0.push_back(Precision(v));
+        std::vector<std::array<long, 3>> blocks;
+        for (long L = 0; L <= L_max; ++L) blocks.push_back({L*CN*C, CN, C});
+        set_weight(W0_weights, w0, blocks);
+        std::vector<Precision> b;
+        for (const auto& r : fc.at("h_bias")) for (const auto& x : r) b.push_back(x.get<Precision>());
+        field_b.upload(b, 0);
+        const auto& terms = fc.at("terms");
+        field_nt = int(terms.size());
+        if (field_nt > 8) throw std::runtime_error(prefix + "more than 8 field-coupling terms");
+        std::vector<std::vector<Precision>> Wl(4);
+        std::vector<Precision> cg(75L*std::max(field_nt, 1), 0);
+        for (int t = 0; t < field_nt; ++t) {
+            const int li = terms[t].at("l_in");
+            const int lo = terms[t].at("l_out");
+            if (li > L_max or lo > L_max) throw std::runtime_error(prefix + "field-coupling term beyond L_max");
+            field_li[t] = li;
+            field_lo[t] = lo;
+            field_tl[t] = field_ntl[lo]++;
+            const auto w = terms[t].at("W").get<std::vector<double>>();  // [k_out][k_in]
+            const auto c = terms[t].at("cg").get<std::vector<double>>();  // [mo][mi][mf]
+            if ((long)w.size() != (long)C*C or (long)c.size() != (2*lo + 1)*(2*li + 1)*3)
+                throw std::runtime_error(prefix + "malformed field-coupling term");
+            // stacked weight of l_out: rows (term, k_in), columns k_out
+            auto& S = Wl[lo];
+            const long base = (long)S.size();
+            S.resize(base + (long)C*C);
+            for (int ko = 0; ko < C; ++ko)
+                for (int ki = 0; ki < C; ++ki) S[base + (long)ki*C + ko] = Precision(w[(long)ko*C + ki]);
+            for (size_t q = 0; q < c.size(); ++q) cg[75L*t + q] = Precision(c[q]);
+        }
+        for (int lo = 0; lo < 4; ++lo)
+            if (field_ntl[lo]) set_weight(field_Wl[lo], Wl[lo], {{0L, (long)field_ntl[lo]*C, (long)C}});
+        field_C.upload(cg, 0);
+        field_E.upload(std::vector<Precision>(3, Precision(0)), 0);
+        field_P.reserve(3);
+    }
+
     if (js.contains("H1_bias")) {
         std::vector<Precision> b;
         for (const auto& r : js.at("H1_bias")) for (const auto& x : r) b.push_back(x.get<Precision>());
@@ -1902,7 +2131,7 @@ void MACEFoundationCuda<Precision, mixed>::load(const std::string& filename, con
     }
 
     if (fp16_gemms) {
-        amax.reserve(12);
+        amax.reserve(16);
         CHECK(cudaFuncSetAttribute(k_gemm<128, 128, 4, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                    gemm_smem<128, 128>));
         CHECK(cudaFuncSetAttribute(k_gemm<128, 64, 4, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1922,6 +2151,18 @@ void MACEFoundationCuda<Precision, mixed>::load(const std::string& filename, con
     }
     *err = 0;
     outputs.reserve(7);
+}
+
+template <class Precision, bool mixed>
+void MACEFoundationCuda<Precision, mixed>::set_electric_field(const double* e)
+{
+    if (not field_mode) {
+        if (e[0] != 0 or e[1] != 0 or e[2] != 0)
+            throw std::runtime_error("MACEFoundation: the model has no electric-field coupling");
+        return;
+    }
+    const std::vector<Precision> v = {Precision(e[0]), Precision(e[1]), Precision(e[2])};
+    field_E.upload(v, stream);
 }
 
 template <class Precision, bool mixed>

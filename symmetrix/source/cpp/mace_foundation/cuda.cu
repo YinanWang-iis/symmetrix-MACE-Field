@@ -159,6 +159,10 @@ struct MACEFoundationCUDA : Evaluator {
     ~MACEFoundationCUDA() override;
     double compute(int n, const double* x, const int* numbers, const double* cell, const bool* pbc,
                    double* forces, double* virial, double* energies) override;
+    bool has_field_coupling() const override { return mace.field_mode; }
+    void set_electric_field(const double* e) override { mace.set_electric_field(e); }
+    void polarization(double* p) const override { std::copy(P, P + 3, p); }
+    double P[3] = {0, 0, 0};
     template <class Sh> double compute_shape(int, const double*, const double*, double*, double*, double*);
     template <class Sh>
     void compute_node_energies_forces(const Model<Precision>&, const Graph<Precision>&, const Atoms&, bool);
@@ -278,7 +282,7 @@ double MACEFoundationCUDA<Precision, mixed>::compute_shape(int n, const double* 
         G.edge_forces, G.Phi0, G.A0, G.M0, G.H1,
         G.Phi1, G.A1, G.H1_adj, G.A1_adj, G.dPhi1, G.M0_adj, G.A0_adj, G.Phi0_adj, G.s0, G.s1, G.dot0, G.dot1,
         G.node_energies, mace.scan_storage.p, G.X0, G.X1, G.Tg, G.T_adj, G.X_adj, G.B1, G.B1_adj, G.M0s_adj,
-        G.M1, G.M1_adj};
+        G.M1, G.M1_adj, G.Hh, G.Vf, G.Df, G.P};
     for (const auto& [b, e, t] : mace.segments)
         key.insert(key.end(), {(const void*)(long)b, (const void*)(long)e, (const void*)(long)t});
     const bool capture = key != captured;
@@ -292,6 +296,7 @@ double MACEFoundationCUDA<Precision, mixed>::compute_shape(int n, const double* 
     CHECK(cudaMemcpyAsync(forces, A.f, 3*(size_t)n*sizeof(double), cudaMemcpyDeviceToHost, mace.stream));
     if (energies)
         CHECK(cudaMemcpyAsync(energies, eatom, (size_t)n*sizeof(double), cudaMemcpyDeviceToHost, mace.stream));
+    if (mace.field_mode) CHECK(cudaMemcpyAsync(P, mace.field_P, 3*sizeof(double), cudaMemcpyDeviceToHost, mace.stream));
     CHECK(cudaStreamSynchronize(mace.stream));
     if (*mace.err & ERR_SHORT) {
         *mace.err = 0;
