@@ -65,7 +65,9 @@ def _probe_terms(model, tol=1e-9):
                         "cg": Vt[c].tolist(),  # [mo][mi][mf]
                     }
                 )
-            logging.info(f"field block l_in={li} l_out={lo}: rank {keep.sum()} (s={s[:3]})")
+            logging.info(
+                f"field block l_in={li} l_out={lo}: rank {keep.sum()} (s={s[:3]})"
+            )
     # validate
     rng = np.random.default_rng(0)
     h = torch.tensor(rng.normal(size=(5, d)))
@@ -84,7 +86,9 @@ def _probe_terms(model, tol=1e-9):
         v = np.einsum("oim,bki,bm->bko", cg, hl, e.numpy())
         rec[:, so : so + Co * no] += np.einsum("jk,bko->bjo", W, v).reshape(5, Co * no)
     err = np.abs(rec - ref).max() / np.abs(ref).max()
-    logging.warning(f"field coupling: {len(terms)} terms, relative reconstruction error {err:.2e}")
+    logging.warning(
+        f"field coupling: {len(terms)} terms, relative reconstruction error {err:.2e}"
+    )
     if err > 1e-10:
         raise RuntimeError(f"field coupling reconstruction failed ({err})")
     return terms, err
@@ -120,7 +124,9 @@ def extract_mace_field_data(model_file, species, **kwargs):
     readout_1 = model.readouts[0].linear.weight.numpy(force=True) / np.sqrt(C)
     scale = model.scale_shift.scale.item()
 
-    first_residual = isinstance(model.interactions[0], RealAgnosticResidualInteractionBlock)
+    first_residual = isinstance(
+        model.interactions[0], RealAgnosticResidualInteractionBlock
+    )
     if first_residual:
         with torch.no_grad():
             eye = torch.eye(Tm, dtype=torch.float64)
@@ -143,8 +149,10 @@ def extract_mace_field_data(model_file, species, **kwargs):
     output["readout_1_weights_for_M0"] = (readout_1 * scale).tolist()
     H2 = []
     for i in indices:
-        w = model.interactions[1].skip_tp.weight_view_for_instruction(0)[:, i, :].numpy(
-            force=True
+        w = (
+            model.interactions[1]
+            .skip_tp.weight_view_for_instruction(0)[:, i, :]
+            .numpy(force=True)
         )
         H2.append((w / np.sqrt(Tm * C)).flatten().tolist())
     output["H2_weights_for_M0"] = H2

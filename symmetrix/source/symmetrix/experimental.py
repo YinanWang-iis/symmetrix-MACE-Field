@@ -13,9 +13,18 @@ class MACEFoundation(BaseCalculator):
     (mace-field reports this divided by the cell volume).
     """
 
-    implemented_properties = ["energy", "free_energy", "energies", "forces", "stress", "polarization"]
+    implemented_properties = [
+        "energy",
+        "free_energy",
+        "energies",
+        "forces",
+        "stress",
+        "polarization",
+    ]
 
-    def __init__(self, model_file, device="cuda", dtype="float64", skin=1.0, electric_field=None):
+    def __init__(
+        self, model_file, device="cuda", dtype="float64", skin=1.0, electric_field=None
+    ):
         from ._mace_foundation import MACEFoundation as Evaluator
 
         warnings.warn(
@@ -37,7 +46,9 @@ class MACEFoundation(BaseCalculator):
         field = self.electric_field
         if field is None:
             field = a.info.get("electric_field")
-        field = np.zeros(3) if field is None else np.asarray(field, dtype=float).reshape(3)
+        field = (
+            np.zeros(3) if field is None else np.asarray(field, dtype=float).reshape(3)
+        )
         self.evaluator.set_electric_field(field)
         energy, forces, virial, energies = self.evaluator.compute(
             a.positions, a.numbers, a.cell.array, a.pbc, "energies" in properties
