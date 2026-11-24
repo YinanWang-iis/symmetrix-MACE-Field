@@ -96,6 +96,13 @@ class PairSymmetrixMACEFoundationKokkos : public Pair, public KokkosBase {
   int nall = 0;
   bool ready = false;
 
+  // MACE-Field: pair_style ... efield Ex Ey Ez (numbers or v_name equal-style variables, V/A)
+  bool efield = false;
+  std::array<std::string, 3> efield_str;
+  std::array<int, 3> efield_var{-1, -1, -1};
+  std::array<double, 3> efield_val{0, 0, 0};
+  bool field_model = false;
+
   cudaStream_t caller;
   cudaEvent_t ev_in, ev_out;
   std::array<cudaGraphExec_t, 3> graphs{};

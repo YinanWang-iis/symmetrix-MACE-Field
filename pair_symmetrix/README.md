@@ -79,6 +79,28 @@ The default 256 spline points have proven sufficient for most observables. For v
 * `direct_exchange fp16_wire` (float32 styles) sends the feature updates between nodes in fp16 (about 1e-4 eV/A in the
   forces).
 
+### MACE-Field models (experimental prototype, Kokkos GPU only)
+
+[MACE-Field](https://github.com/mdi-group/mace-field) models fine-tuned from a supported foundation shape (two
+layers, field coupling after the first) run with the GPU foundation styles. Extract them in a mace-field
+environment with `symmetrix.extract_mace_field.extract_mace_field_data(model, species)` and write the result
+as JSON. The uniform field is given in the pair style:
+```
+variable      Ez equal 0.03*ramp(0,1)            # any equal-style variable, evaluated every step
+pair_style    symmetrix/mace/foundation/float32 efield 0.0 0.0 v_Ez   # numbers or v_name, V/Angstrom
+pair_coeff    * * macefield-8-22-56.json Ba Ti O
+compute       P all pair symmetrix/mace/foundation/float32
+thermo_style  custom step temp pe c_P[1] c_P[2] c_P[3]
+```
+* The field is the model's `electric_field` input (Cartesian, V/A), with the same meaning and sign as in the
+  ASE `MACECalculator(model_type="MACEField")` and `symmetrix.experimental.MACEFoundation(electric_field=...)`.
+  The energy is the electric enthalpy E(R, field) of the model; forces are -dE/dR at that field.
+* `compute pair` returns P = -dE/d(field) for the whole box in e*Angstrom (not divided by the volume; mace-field
+  reports it divided by the volume). With several MPI processes each process contributes its local atoms and
+  `compute pair` sums them.
+* Without `efield` a MACE-Field model runs at zero field. `efield` with a model that has no field coupling, or
+  with the CPU styles, is an error.
+
 ### Building LAMMPS
 
 Some (probably incomplete) prerequisites are:

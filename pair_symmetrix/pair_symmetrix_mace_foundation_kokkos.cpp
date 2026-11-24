@@ -20,6 +20,8 @@
 #include "comm.h"
 #include "error.h"
 #include "force.h"
+#include "input.h"
+#include "variable.h"
 #include "mace_foundation_cuda.hpp"
 #include "memory_kokkos.h"
 #include "neigh_list_kokkos.h"
@@ -27,6 +29,7 @@
 #include "neighbor.h"
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <stdexcept>
 
@@ -256,6 +259,7 @@ PairSymmetrixMACEFoundationKokkos<Precision, mixed>::PairSymmetrixMACEFoundation
 template<typename Precision, bool mixed>
 PairSymmetrixMACEFoundationKokkos<Precision, mixed>::~PairSymmetrixMACEFoundationKokkos()
 {
+  delete[] pvector;
   if (allocated) {
     memory->destroy(setflag);
     memory->destroy(cutsq);
@@ -297,6 +301,16 @@ void PairSymmetrixMACEFoundationKokkos<Precision, mixed>::compute_shape(int efla
       memoryKK->create_kokkos(k_eatom,eatom,maxeatom,"pair:eatom");
     }
     Kokkos::deep_copy(k_eatom.template view<LMPDeviceType>(), 0.0);
+  }
+
+  // MACE-Field: evaluate the field (equal-style variables may depend on step/time) and pass it to the model
+  if (field_model) {
+    double e[3];
+    for (int d = 0; d < 3; ++d) {
+      e[d] = efield_var[d] >= 0 ? input->variable->compute_equal(efield_var[d]) : efield_val[d];
+      if (!std::isfinite(e[d])) error->all(FLERR, "{} efield component {} is not finite", force->pair_style, d+1);
+    }
+    mace->set_electric_field(e);
   }
 
   const bool rebuilt = neighbor->ago == 0 or atomKK->k_type.need_sync_device();
@@ -385,7 +399,7 @@ void PairSymmetrixMACEFoundationKokkos<Precision, mixed>::compute_shape(int efla
       G.edge_forces, G.Phi0, G.A0, G.M0, G.H1,
       G.Phi1, G.A1, G.H1_adj, G.A1_adj, G.dPhi1, G.M0_adj, G.A0_adj, G.Phi0_adj, G.s0, G.s1, G.dot0, G.dot1,
       G.node_energies, mace->scan_storage.p, G.X0, G.X1, G.Tg, G.T_adj, G.X_adj, G.B1, G.B1_adj, G.M0s_adj,
-      G.M1, G.M1_adj};
+      G.M1, G.M1_adj, G.Hh, G.Vf, G.Df, G.P};
   for (const auto& [b, e, t] : mace->segments)
     key.insert(key.end(), {(const void*)(long)b, (const void*)(long)e, (const void*)(long)t});
   const bool capture = mace->N > 0 and key != captured;
@@ -400,12 +414,18 @@ void PairSymmetrixMACEFoundationKokkos<Precision, mixed>::compute_shape(int efla
     double* d_eatom = eflag_atom ? k_eatom.view<LMPDeviceType>().data() : nullptr;
     k_outputs<<<blocks(mace->N, WARPS), 32*WARPS, 0, mace->stream>>>(G, d_eatom, mace->outputs);
     double out[7];
+    double P[3] = {0, 0, 0};
     CHECK(cudaMemcpyAsync(out, mace->outputs, sizeof(out), cudaMemcpyDeviceToHost, mace->stream));
+    if (field_model) CHECK(cudaMemcpyAsync(P, mace->field_P, sizeof(P), cudaMemcpyDeviceToHost, mace->stream));
     CHECK(cudaStreamSynchronize(mace->stream));
     check_errors();
+    // P = -dE/d(field) of this process's local atoms, e*A; compute pair sums it over processes
+    if (field_model) for (int d = 0; d < 3; ++d) pvector[d] = P[d];
     if (eflag_global) eng_vdwl += out[0];
     if (vflag_global) for (int i=0; i<6; ++i) virial[i] += out[1 + i];
   }
+
+  if (field_model and mace->N == 0) for (int d = 0; d < 3; ++d) pvector[d] = 0;
 
   if (eflag_atom) {
     k_eatom.modify<LMPDeviceType>();
@@ -546,12 +566,28 @@ template<typename Precision, bool mixed>
 void PairSymmetrixMACEFoundationKokkos<Precision, mixed>::settings(int narg, char **arg)
 {
   std::string mode = (comm->nprocs == 1) ? "no_domain_decomposition" : "mpi_message_passing";
-  if (narg == 1) {
-    mode = std::string(arg[0]);
-    if (mode != "no_domain_decomposition" and mode != "mpi_message_passing")
-      error->all(FLERR, "The command \'pair_style {} {}\' is invalid", force->pair_style, mode);
-  } else if (narg > 1) {
-    error->all(FLERR, "Too many pair_style arguments for {}", force->pair_style);
+  efield = false;
+  int iarg = 0;
+  bool mode_set = false;
+  while (iarg < narg) {
+    const std::string a(arg[iarg]);
+    if (a == "efield") {
+      // efield Ex Ey Ez: numbers or v_name (equal-style), V/A, the MACE-Field model's electric_field input
+      if (iarg + 4 > narg) error->all(FLERR, "pair_style {} efield needs three components", force->pair_style);
+      for (int d = 0; d < 3; ++d) {
+        efield_str[d] = arg[iarg + 1 + d];
+        if (!utils::strmatch(efield_str[d], "^v_"))
+          efield_val[d] = utils::numeric(FLERR, efield_str[d], false, lmp);
+      }
+      efield = true;
+      iarg += 4;
+    } else if (!mode_set and (a == "no_domain_decomposition" or a == "mpi_message_passing")) {
+      mode = a;
+      mode_set = true;
+      ++iarg;
+    } else {
+      error->all(FLERR, "The command \'pair_style {} {}\' is invalid", force->pair_style, a);
+    }
   }
 
   if (mode == "no_domain_decomposition" and comm->nprocs != 1)
@@ -581,6 +617,16 @@ void PairSymmetrixMACEFoundationKokkos<Precision, mixed>::coeff(int narg, char *
   captured.clear();
   ready = false;
   utils::logmesg(lmp, "success\n");
+  field_model = mace->field_mode;
+  if (efield and not field_model)
+    error->all(FLERR, "pair_style {} efield needs a MACE-Field model (extracted with symmetrix.extract_mace_field)",
+               force->pair_style);
+  if (field_model) {
+    nextra = 3;
+    if (!pvector) pvector = new double[3];
+    for (int d = 0; d < 3; ++d) pvector[d] = 0;
+    utils::logmesg(lmp, "  MACE-Field model: P = -dE/d(field) in e*Angstrom available as compute pair vector [1-3]\n");
+  }
 
   mace_types = Kokkos::View<int*>("mace_types", narg-3);
   auto h_mace_types = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), mace_types);
@@ -628,6 +674,18 @@ void PairSymmetrixMACEFoundationKokkos<Precision, mixed>::init_style()
   if (atom->map_user == atom->MAP_NONE)
     error->all(FLERR, "{} requires \'atom_modify map [yes|array|hash]\'", force->pair_style);
   if (force->newton_pair == 0) error->all(FLERR, "{} requires newton pair on", force->pair_style);
+  for (int d = 0; d < 3; ++d) {
+    efield_var[d] = -1;
+    if (efield and utils::strmatch(efield_str[d], "^v_")) {
+      efield_var[d] = input->variable->find(efield_str[d].c_str() + 2);
+      if (efield_var[d] < 0)
+        error->all(FLERR, "Variable {} for pair_style {} efield does not exist", efield_str[d].substr(2),
+                   force->pair_style);
+      if (!input->variable->equalstyle(efield_var[d]))
+        error->all(FLERR, "Variable {} for pair_style {} efield must be equal-style", efield_str[d].substr(2),
+                   force->pair_style);
+    }
+  }
   comm_forward = exchange ? mace->num_LM*mace->num_channels : 0;
   comm_reverse = exchange ? mace->num_LM*mace->num_channels : 0;
 

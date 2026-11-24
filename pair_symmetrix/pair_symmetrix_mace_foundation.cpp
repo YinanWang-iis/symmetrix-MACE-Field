@@ -254,6 +254,10 @@ template <typename Precision>
 void PairSymmetrixMACEFoundation<Precision>::settings(int narg, char **arg)
 {
   std::string mode = (comm->nprocs == 1) ? "no_domain_decomposition" : "mpi_message_passing";
+  for (int i = 0; i < narg; ++i)
+    if (std::string(arg[i]) == "efield")
+      error->all(FLERR, "pair_style {}: efield (MACE-Field) is supported only by the Kokkos GPU styles "
+                 "symmetrix/mace/foundation[/float32|/float32-mixed]/kk", force->pair_style);
   if (narg == 1) {
     mode = std::string(arg[0]);
     if (mode != "no_domain_decomposition" and mode != "mpi_message_passing")
